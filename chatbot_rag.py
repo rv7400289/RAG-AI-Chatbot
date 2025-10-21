@@ -128,7 +128,7 @@ vector_store = FAISS.load_local(
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-    st.session_state.messages.append(SystemMessage("You are an assistant for question-answering tasks. "))
+  
 
 # display chat messages from history on app rerun
 for message in st.session_state.messages:
@@ -184,21 +184,26 @@ if prompt:
         st.error(f"Retrieval error: {e}")
         st.stop()
 
-    system_prompt = """You are an assistant for question-answering tasks. 
-    Use the following pieces of retrieved context to answer the question. 
-    If you don't know the answer, just say that you don't know. 
-    Use three sentences maximum and keep the answer concise.
-    Context: {context}:"""
+system_prompt = """You are an assistant for question-answering tasks. 
+Use the following pieces of retrieved context to answer the question. 
+If you don't know the answer, just say that you don't know. 
+Use three sentences maximum and keep the answer concise.
+Context: {context}:"""
 
-    # truncate context to reduce token usage
-    context_max = 2000
-    system_prompt_fmt = system_prompt.format(context=docs_text[:context_max])
+# truncate context to reduce token usage
+context_max = 2000
+system_prompt_fmt = system_prompt.format(context=docs_text[:context_max])
 
-    print("-- SYS PROMPT --")
-    print(system_prompt_fmt)
+print("-- SYS PROMPT --")
+print(system_prompt_fmt)
 
-    st.session_state.messages.append(SystemMessage(system_prompt_fmt))
-
+# Build a clean message history for Gemini: single SystemMessage first, then prior human/ai turns
+clean_messages = [SystemMessage(system_prompt_fmt)]
+for msg in st.session_state.messages:
+    if isinstance(msg, SystemMessage):
+        # skip any existing system messages to avoid multiple system roles
+        continue
+    clean_messages.append(msg)
     # attempt invoke with fallback over stable models if a 404 NotFound occurs
     candidates = []
     if os.environ.get("GEMINI_CHAT_MODEL"):
