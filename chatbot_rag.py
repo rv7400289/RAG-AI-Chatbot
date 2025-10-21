@@ -112,7 +112,7 @@ if st.session_state.get("authenticated"):
         except Exception:
             pass
 
-# initialize embeddings + local Chroma vector store (Gemini)
+# initialize embeddings + local FAISS vector store (Gemini)
 embeddings = GoogleGenerativeAIEmbeddings(
     model=os.environ.get("GEMINI_EMBEDDING_MODEL", "models/text-embedding-004"),
     google_api_key=os.environ.get("GOOGLE_API_KEY"),
@@ -128,8 +128,6 @@ vector_store = FAISS.load_local(
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-  
-
 # display chat messages from history on app rerun
 for message in st.session_state.messages:
     if isinstance(message, HumanMessage):
@@ -144,7 +142,6 @@ prompt = st.chat_input("How are you?")
 
 # did the user submit a prompt?
 if prompt:
-
     with st.chat_message("user"):
         st.markdown(prompt)
         st.session_state.messages.append(HumanMessage(prompt))
@@ -168,6 +165,8 @@ if prompt:
         transport="rest",
     )
 
+    # retrieval
+    docs_text = ""  # ensure defined even if retrieval fails before assignment
     try:
         print("[chat] invoking retriever...")
         print("[chat] embedding query...")
@@ -184,26 +183,27 @@ if prompt:
         st.error(f"Retrieval error: {e}")
         st.stop()
 
-system_prompt = """You are an assistant for question-answering tasks. 
-Use the following pieces of retrieved context to answer the question. 
-If you don't know the answer, just say that you don't know. 
-Use three sentences maximum and keep the answer concise.
-Context: {context}:"""
+    system_prompt = """You are an assistant for question-answering tasks. 
+    Use the following pieces of retrieved context to answer the question. 
+    If you don't know the answer, just say that you don't know. 
+    Use three sentences maximum and keep the answer concise.
+    Context: {context}:"""
 
-# truncate context to reduce token usage
-context_max = 2000
-system_prompt_fmt = system_prompt.format(context=docs_text[:context_max])
+    # truncate context to reduce token usage
+    context_max = 2000
+    system_prompt_fmt = system_prompt.format(context=docs_text[:context_max])
 
-print("-- SYS PROMPT --")
-print(system_prompt_fmt)
+    print("-- SYS PROMPT --")
+    print(system_prompt_fmt)
 
-# Build a clean message history for Gemini: single SystemMessage first, then prior human/ai turns
-clean_messages = [SystemMessage(system_prompt_fmt)]
-for msg in st.session_state.messages:
-    if isinstance(msg, SystemMessage):
-        # skip any existing system messages to avoid multiple system roles
-        continue
-    clean_messages.append(msg)
+    # Build a clean message history for Gemini: single SystemMessage first, then prior human/ai turns
+    clean_messages = [SystemMessage(system_prompt_fmt)]
+    for msg in st.session_state.messages:
+        if isinstance(msg, SystemMessage):
+            # skip any existing system messages to avoid multiple system roles
+            continue
+        clean_messages.append(msg)
+
     # attempt invoke with fallback over stable models if a 404 NotFound occurs
     candidates = []
     if os.environ.get("GEMINI_CHAT_MODEL"):
@@ -230,7 +230,8 @@ for msg in st.session_state.messages:
                 google_api_key=os.environ.get("GOOGLE_API_KEY"),
                 transport="rest",
             )
-            result = llm.invoke(st.session_state.messages).content
+            # Invoke with sanitized message list (single leading SystemMessage)
+            result = llm.invoke(clean_messages).content
             print("[chat] LLM response received")
             # cache working model for this session
             st.session_state["gemini_model"] = m
