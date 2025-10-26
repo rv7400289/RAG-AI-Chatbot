@@ -164,6 +164,23 @@ def gh_put_directory(local_dir: Path, dest_dir: str, message_prefix: str = "chor
             uploaded += 1
     return uploaded
 
+def gh_delete_file(dest_path: str, message_prefix: str = "chore: delete"):
+    owner, repo, branch = _gh_base()
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{dest_path}"
+    sha = gh_get_file_sha(dest_path)
+    if not sha:
+        return None
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    data = {
+        "message": f"{message_prefix} {dest_path} at {ts}",
+        "sha": sha,
+        "branch": branch,
+    }
+    r = requests.delete(url, headers=_gh_headers(), json=data, timeout=60)
+    if r.status_code not in (200, 204):
+        raise RuntimeError(f"GitHub delete failed for {dest_path}: {r.status_code} {r.text}")
+    return True
+
 # Build/rebuild index helper
 def build_index():
     loader = PyPDFDirectoryLoader(str(documents_dir))
@@ -222,12 +239,41 @@ if st.sidebar.button("Update Index"):
     except Exception as e:
         st.sidebar.error(f"Index update failed: {e}")
 
-# Sidebar: optional document filter for retrieval
+# Sidebar: document filter for retrieval
 available_pdfs = sorted([p.name for p in documents_dir.glob("*.pdf")])
 st.session_state.setdefault("doc_filter", [])
 st.session_state["doc_filter"] = st.sidebar.multiselect(
     "Limit answers to selected document(s)", options=available_pdfs, default=st.session_state.get("doc_filter", [])
 )
+
+# Sidebar: delete selected docs (local) with optional GitHub delete, then rebuild index
+st.sidebar.markdown("---")
+st.sidebar.caption("Maintenance")
+files_to_delete = st.sidebar.multiselect("Delete document(s)", options=available_pdfs)
+delete_on_github = st.sidebar.checkbox("Also delete from GitHub", value=False)
+if st.sidebar.button("Delete selected"):
+    removed = 0
+    for name in files_to_delete:
+        local_fp = documents_dir / name
+        try:
+            if local_fp.exists():
+                local_fp.unlink()
+                removed += 1
+        except Exception as e:
+            st.sidebar.error(f"Local delete failed for {name}: {e}")
+        if delete_on_github:
+            try:
+                gh_delete_file(f"documents/{name}", message_prefix="chore: delete document")
+            except Exception as e:
+                st.sidebar.error(f"GitHub delete failed for {name}: {e}")
+    if removed:
+        try:
+            build_index()
+            st.sidebar.success(f"Deleted {removed} file(s) and rebuilt index")
+        except Exception as e:
+            st.sidebar.error(f"Index rebuild failed: {e}")
+    else:
+        st.sidebar.info("No files deleted")
 
 # Chat history
 if "messages" not in st.session_state:
