@@ -1,28 +1,24 @@
 #import streamlit
 import streamlit as st
 import os
-from dotenv import load_dotenv
 import base64
 import requests
 from datetime import datetime, timezone
+from dotenv import load_dotenv
 
-# vector store
 from langchain_community.vectorstores import FAISS
-
-# import langchain
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-import google.generativeai as genai
-from pathlib import Path
 from langchain_community.document_loaders import PyPDFDirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+import google.generativeai as genai
+from pathlib import Path
 
-# load .env from project root deterministically
+# Load .env deterministically
 env_path = Path(__file__).resolve().parent / ".env"
 if not env_path.exists():
     env_path = Path(__file__).resolve().parents[0] / ".env"
 load_dotenv(dotenv_path=str(env_path), override=True)
-# also read raw dotenv values to ensure creds are available
 from dotenv import dotenv_values
 raw_vals = dotenv_values(str(env_path)) if env_path.exists() else {}
 if raw_vals.get("ADMIN_USER"):
@@ -30,10 +26,9 @@ if raw_vals.get("ADMIN_USER"):
 if raw_vals.get("ADMIN_PASSWORD"):
     os.environ["ADMIN_PASSWORD"] = (raw_vals["ADMIN_PASSWORD"] or "").strip().strip('"').strip("'")
 
-# startup diagnostics and normalization
+# Startup diagnostics and normalization
 print("[startup] dotenv:", str(env_path))
 raw_env_model = os.environ.get("GEMINI_CHAT_MODEL", "")
-# normalize: ensure fully-qualified name starts with 'models/'
 normalized_env_model = raw_env_model.strip().strip('"').strip("'")
 if normalized_env_model and not normalized_env_model.startswith("models/"):
     normalized_env_model = f"models/{normalized_env_model}"
@@ -42,7 +37,7 @@ print("[startup] GEMINI_CHAT_MODEL:", os.environ.get("GEMINI_CHAT_MODEL"))
 
 st.title("AI Assistant")
 
-# single-page admin login gate
+# Admin login gate
 source = "env"
 try:
     import streamlit as _stref
@@ -81,22 +76,7 @@ if not st.session_state.authenticated:
             st.error("Invalid credentials")
     st.stop()
 
-# get admin creds (prefer Streamlit secrets if available), else env; normalize
-source = "env"
-try:
-    import streamlit as _st_ref
-    if hasattr(_st_ref, "secrets") and _st_ref.secrets:  # prefer secrets first
-        admin_user = (_st_ref.secrets.get("ADMIN_USER", "") or "").strip().strip('"').strip("'")
-        admin_pass = (_st_ref.secrets.get("ADMIN_PASSWORD", "") or "").strip().strip('"').strip("'")
-        source = "secrets"
-    else:
-        admin_user = (os.environ.get("ADMIN_USER", "") or "").strip().strip('"').strip("'")
-        admin_pass = (os.environ.get("ADMIN_PASSWORD", "") or "").strip().strip('"').strip("'")
-except Exception:
-    admin_user = (os.environ.get("ADMIN_USER", "") or "").strip().strip('"').strip("'")
-    admin_pass = (os.environ.get("ADMIN_PASSWORD", "") or "").strip().strip('"').strip("'")
-
-# diagnostics
+# Diagnostics
 try:
     import streamlit as _st_dbg
     sec_keys = list(_st_dbg.secrets.keys()) if hasattr(_st_dbg, "secrets") else []
@@ -107,7 +87,6 @@ print(f"[startup] ADMIN_PASSWORD set: {bool(admin_pass)} (source={source})")
 
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
-# logout control (shown only after successful login)
 if st.session_state.get("authenticated"):
     if st.sidebar.button("Logout"):
         st.session_state.authenticated = False
@@ -128,6 +107,62 @@ embeddings = GoogleGenerativeAIEmbeddings(
     google_api_key=os.environ.get("GOOGLE_API_KEY"),
     transport="rest",
 )
+
+# GitHub helpers
+def _gh_headers():
+    token = st.secrets.get("GITHUB_TOKEN") if hasattr(st, "secrets") else os.environ.get("GITHUB_TOKEN")
+    if not token:
+        raise RuntimeError("GITHUB_TOKEN not set in secrets.")
+    return {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+    }
+
+def _gh_base():
+    owner = st.secrets.get("GITHUB_OWNER") if hasattr(st, "secrets") else os.environ.get("GITHUB_OWNER")
+    repo = st.secrets.get("GITHUB_REPO") if hasattr(st, "secrets") else os.environ.get("GITHUB_REPO")
+    branch = st.secrets.get("GITHUB_BRANCH") if hasattr(st, "secrets") else os.environ.get("GITHUB_BRANCH", "main")
+    if not owner or not repo:
+        raise RuntimeError("GITHUB_OWNER or GITHUB_REPO missing in secrets.")
+    return owner, repo, branch
+
+def gh_get_file_sha(dest_path: str):
+    owner, repo, branch = _gh_base()
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{dest_path}?ref={branch}"
+    r = requests.get(url, headers=_gh_headers(), timeout=30)
+    if r.status_code == 200:
+        return r.json().get("sha")
+    return None
+
+def gh_put_file(local_path: str, dest_path: str, message_prefix: str = "chore: upload"):
+    owner, repo, branch = _gh_base()
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{dest_path}"
+    with open(local_path, "rb") as f:
+        content_b64 = base64.b64encode(f.read()).decode("utf-8")
+    sha = gh_get_file_sha(dest_path)
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    data = {
+        "message": f"{message_prefix} {dest_path} at {ts}",
+        "content": content_b64,
+        "branch": branch,
+    }
+    if sha:
+        data["sha"] = sha
+    r = requests.put(url, headers=_gh_headers(), json=data, timeout=60)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"GitHub commit failed for {dest_path}: {r.status_code} {r.text}")
+    return r.json()
+
+def gh_put_directory(local_dir: Path, dest_dir: str, message_prefix: str = "chore: upload dir"):
+    uploaded = 0
+    for root, _, files in os.walk(local_dir):
+        for name in files:
+            local_path = Path(root) / name
+            rel = local_path.relative_to(local_dir)
+            dest_path = f"{dest_dir}/{rel.as_posix()}"
+            gh_put_file(str(local_path), dest_path, message_prefix=message_prefix)
+            uploaded += 1
+    return uploaded
 
 # Build/rebuild index helper
 def build_index():
@@ -155,8 +190,11 @@ if "vector_store" not in st.session_state:
     except Exception:
         st.session_state["vector_store"] = None
 
-# Sidebar: upload + reindex
+# Sidebar: upload, reindex, push
 uploaded = st.sidebar.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
+push_to_github = st.sidebar.checkbox("Also push uploads to GitHub", value=False)
+push_index_btn = st.sidebar.button("Push index folder to GitHub")
+
 if uploaded:
     saved = 0
     for f in uploaded:
@@ -164,12 +202,23 @@ if uploaded:
         with open(dest, "wb") as out:
             out.write(f.getbuffer())
         saved += 1
+        if push_to_github:
+            try:
+                gh_put_file(str(dest), f"documents/{f.name}", message_prefix="feat: add document")
+            except Exception as e:
+                st.sidebar.error(f"GitHub upload failed for {f.name}: {e}")
     st.sidebar.success(f"Uploaded {saved} file(s) to documents/")
 
 if st.sidebar.button("Update Index"):
     try:
         build_index()
         st.sidebar.success("Index updated")
+        if push_to_github or push_index_btn:
+            try:
+                count = gh_put_directory(index_dir, "faiss_gemini", message_prefix="feat: update index")
+                st.sidebar.success(f"Pushed {count} index files to GitHub")
+            except Exception as e:
+                st.sidebar.error(f"GitHub index push failed: {e}")
     except Exception as e:
         st.sidebar.error(f"Index update failed: {e}")
 
@@ -180,13 +229,10 @@ st.session_state["doc_filter"] = st.sidebar.multiselect(
     "Limit answers to selected document(s)", options=available_pdfs, default=st.session_state.get("doc_filter", [])
 )
 
-# initialize chat history
+# Chat history
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-    st.session_state.messages.append(SystemMessage("You are an assistant for question-answering tasks. "))
-
-# display chat messages from history on app rerun
 for message in st.session_state.messages:
     if isinstance(message, HumanMessage):
         with st.chat_message("user"):
@@ -195,23 +241,18 @@ for message in st.session_state.messages:
         with st.chat_message("assistant"):
             st.markdown(message.content)
 
-# create the bar where we can type messages
 prompt = st.chat_input("How are you?")
 
-# did the user submit a prompt?
 if prompt:
-
     with st.chat_message("user"):
         st.markdown(prompt)
         st.session_state.messages.append(HumanMessage(prompt))
 
-    # strict: require GEMINI_CHAT_MODEL from .env and force usage for this session
     model_env = os.environ.get("GEMINI_CHAT_MODEL")
     if not model_env:
         st.error("Set GEMINI_CHAT_MODEL in .env to a supported model, e.g., models/gemini-2.5-flash")
         st.stop()
     selected_model = model_env
-    # if a previous session model exists but differs from current .env, clear it
     if st.session_state.get("gemini_model") and st.session_state["gemini_model"] != selected_model:
         del st.session_state["gemini_model"]
     st.session_state["gemini_model"] = selected_model
@@ -221,23 +262,16 @@ if prompt:
         st.error("Vector index not found. Upload PDFs and click 'Update Index' first.")
         st.stop()
 
-    llm = ChatGoogleGenerativeAI(
-        model=selected_model,
-        temperature=float(os.environ.get("OPENAI_TEMPERATURE", "0.2")),
-        google_api_key=os.environ.get("GOOGLE_API_KEY"),
-        transport="rest",
-    )
-
+    # Retrieval
+    docs_text = ""
     try:
         print("[chat] invoking retriever...")
         print("[chat] embedding query...")
         qvec = embeddings.embed_query(prompt)
         print(f"[chat] embed_ok dim={len(qvec)}")
         print("[chat] querying FAISS by vector...")
-        # pull more candidates to allow post-filtering by filename
         docs = st.session_state["vector_store"].similarity_search_by_vector(qvec, k=20)
         print(f"[chat] retrieved {len(docs)} docs (pre-filter)")
-        # optional filter by selected filenames in sidebar
         selected_files = set(st.session_state.get("doc_filter", []) or [])
         if selected_files:
             def _is_selected(doc):
@@ -262,21 +296,18 @@ if prompt:
     Use three sentences maximum and keep the answer concise.
     Context: {context}:"""
 
-    # truncate context to reduce token usage
     context_max = 2000
     system_prompt_fmt = system_prompt.format(context=docs_text[:context_max])
 
     print("-- SYS PROMPT --")
     print(system_prompt_fmt)
 
-    # Single SystemMessage first, then prior human/ai turns
     clean_messages = [SystemMessage(system_prompt_fmt)]
     for msg in st.session_state.messages:
         if isinstance(msg, SystemMessage):
             continue
         clean_messages.append(msg)
 
-    # Model candidates (mostly redundant because we enforce env model)
     candidates = []
     if os.environ.get("GEMINI_CHAT_MODEL"):
         candidates = [selected_model]
@@ -304,7 +335,6 @@ if prompt:
             )
             result = llm.invoke(clean_messages).content
             print("[chat] LLM response received")
-            # cache working model for this session
             st.session_state["gemini_model"] = m
             break
         except Exception as e:
@@ -314,7 +344,6 @@ if prompt:
             traceback.print_exc()
             last_err = e
             if "NotFound" in msg or "404" in msg:
-                # try next candidate
                 continue
             if "TooManyRequests" in msg or "quota" in msg.lower():
                 st.error("Gemini quota exceeded. Add billing or switch to a model with available quota (set GEMINI_CHAT_MODEL in .env), then restart.")
