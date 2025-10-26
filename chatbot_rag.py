@@ -11,6 +11,8 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGener
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 import google.generativeai as genai
 from pathlib import Path
+from langchain_community.document_loaders import PyPDFDirectoryLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # load .env from project root deterministically
 env_path = Path(__file__).resolve().parent / ".env"
@@ -112,21 +114,74 @@ if st.session_state.get("authenticated"):
         except Exception:
             pass
 
-# initialize embeddings + local FAISS vector store (Gemini)
+# Paths
+documents_dir = Path(__file__).resolve().parent / "documents"
+documents_dir.mkdir(exist_ok=True)
+index_dir = Path(__file__).resolve().parent / "faiss_gemini"
+
+# Embeddings
 embeddings = GoogleGenerativeAIEmbeddings(
     model=os.environ.get("GEMINI_EMBEDDING_MODEL", "models/text-embedding-004"),
     google_api_key=os.environ.get("GOOGLE_API_KEY"),
     transport="rest",
 )
-vector_store = FAISS.load_local(
-    "faiss_gemini",
-    embeddings,
-    allow_dangerous_deserialization=True,
+
+# Build/rebuild index helper
+def build_index():
+    loader = PyPDFDirectoryLoader(str(documents_dir))
+    raw_documents = loader.load()
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=800,
+        chunk_overlap=400,
+        length_function=len,
+        is_separator_regex=False,
+    )
+    documents = splitter.split_documents(raw_documents)
+    vs = FAISS.from_documents(documents=documents, embedding=embeddings)
+    vs.save_local(str(index_dir))
+    st.session_state["vector_store"] = vs
+
+# Load index if present
+if "vector_store" not in st.session_state:
+    try:
+        st.session_state["vector_store"] = FAISS.load_local(
+            str(index_dir),
+            embeddings,
+            allow_dangerous_deserialization=True,
+        )
+    except Exception:
+        st.session_state["vector_store"] = None
+
+# Sidebar: upload + reindex
+uploaded = st.sidebar.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
+if uploaded:
+    saved = 0
+    for f in uploaded:
+        dest = documents_dir / f.name
+        with open(dest, "wb") as out:
+            out.write(f.getbuffer())
+        saved += 1
+    st.sidebar.success(f"Uploaded {saved} file(s) to documents/")
+
+if st.sidebar.button("Update Index"):
+    try:
+        build_index()
+        st.sidebar.success("Index updated")
+    except Exception as e:
+        st.sidebar.error(f"Index update failed: {e}")
+
+# Sidebar: optional document filter for retrieval
+available_pdfs = sorted([p.name for p in documents_dir.glob("*.pdf")])
+st.session_state.setdefault("doc_filter", [])
+st.session_state["doc_filter"] = st.sidebar.multiselect(
+    "Limit answers to selected document(s)", options=available_pdfs, default=st.session_state.get("doc_filter", [])
 )
 
 # initialize chat history
 if "messages" not in st.session_state:
     st.session_state.messages = []
+
+    st.session_state.messages.append(SystemMessage("You are an assistant for question-answering tasks. "))
 
 # display chat messages from history on app rerun
 for message in st.session_state.messages:
@@ -142,6 +197,7 @@ prompt = st.chat_input("How are you?")
 
 # did the user submit a prompt?
 if prompt:
+
     with st.chat_message("user"):
         st.markdown(prompt)
         st.session_state.messages.append(HumanMessage(prompt))
@@ -158,6 +214,10 @@ if prompt:
     st.session_state["gemini_model"] = selected_model
     print(f"[chat] using model: {selected_model}")
 
+    if st.session_state["vector_store"] is None:
+        st.error("Vector index not found. Upload PDFs and click 'Update Index' first.")
+        st.stop()
+
     llm = ChatGoogleGenerativeAI(
         model=selected_model,
         temperature=float(os.environ.get("OPENAI_TEMPERATURE", "0.2")),
@@ -165,16 +225,26 @@ if prompt:
         transport="rest",
     )
 
-    # retrieval
-    docs_text = ""  # ensure defined even if retrieval fails before assignment
     try:
         print("[chat] invoking retriever...")
         print("[chat] embedding query...")
         qvec = embeddings.embed_query(prompt)
         print(f"[chat] embed_ok dim={len(qvec)}")
         print("[chat] querying FAISS by vector...")
-        docs = vector_store.similarity_search_by_vector(qvec, k=2)
-        print(f"[chat] retrieved {len(docs)} docs")
+        # pull more candidates to allow post-filtering by filename
+        docs = st.session_state["vector_store"].similarity_search_by_vector(qvec, k=20)
+        print(f"[chat] retrieved {len(docs)} docs (pre-filter)")
+        # optional filter by selected filenames in sidebar
+        selected_files = set(st.session_state.get("doc_filter", []) or [])
+        if selected_files:
+            def _is_selected(doc):
+                src = (doc.metadata.get("source") or "").strip()
+                return Path(src).name in selected_files
+            docs = [d for d in docs if _is_selected(d)]
+            print(f"[chat] {len(docs)} docs after filter by {list(selected_files)}")
+        if not docs:
+            st.warning("No matching chunks found in the selected document(s). Try selecting different docs or clearing the filter.")
+            st.stop()
         docs_text = "".join(d.page_content for d in docs)
     except Exception as e:
         import traceback
@@ -196,15 +266,14 @@ if prompt:
     print("-- SYS PROMPT --")
     print(system_prompt_fmt)
 
-    # Build a clean message history for Gemini: single SystemMessage first, then prior human/ai turns
+    # Single SystemMessage first, then prior human/ai turns
     clean_messages = [SystemMessage(system_prompt_fmt)]
     for msg in st.session_state.messages:
         if isinstance(msg, SystemMessage):
-            # skip any existing system messages to avoid multiple system roles
             continue
         clean_messages.append(msg)
 
-    # attempt invoke with fallback over stable models if a 404 NotFound occurs
+    # Model candidates (mostly redundant because we enforce env model)
     candidates = []
     if os.environ.get("GEMINI_CHAT_MODEL"):
         candidates = [selected_model]
@@ -230,7 +299,6 @@ if prompt:
                 google_api_key=os.environ.get("GOOGLE_API_KEY"),
                 transport="rest",
             )
-            # Invoke with sanitized message list (single leading SystemMessage)
             result = llm.invoke(clean_messages).content
             print("[chat] LLM response received")
             # cache working model for this session
