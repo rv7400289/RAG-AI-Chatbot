@@ -209,8 +209,8 @@ if "vector_store" not in st.session_state:
 
 # Sidebar: upload, reindex, push
 uploaded = st.sidebar.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
-push_to_github = st.sidebar.checkbox("Also push uploads to GitHub", value=False)
-push_index_btn = st.sidebar.button("Push index folder to GitHub")
+push_to_github = st.sidebar.checkbox("Also push uploads to Database", value=False)
+push_index_btn = st.sidebar.button("Push index folder to Database")
 
 if uploaded:
     saved = 0
@@ -232,8 +232,8 @@ if st.sidebar.button("Update Index"):
         st.sidebar.success("Index updated")
         if push_to_github or push_index_btn:
             try:
-                count = gh_put_directory(index_dir, "faiss_gemini", message_prefix="feat: update index")
-                st.sidebar.success(f"Pushed {count} index files to GitHub")
+                count = gh_put_directory(index_dir, "faiss_gemini", message_prefix="feat: update Database")
+                st.sidebar.success(f"Pushed {count} index files to Database")
             except Exception as e:
                 st.sidebar.error(f"GitHub index push failed: {e}")
     except Exception as e:
@@ -250,7 +250,7 @@ st.session_state["doc_filter"] = st.sidebar.multiselect(
 st.sidebar.markdown("---")
 st.sidebar.caption("Maintenance")
 files_to_delete = st.sidebar.multiselect("Delete document(s)", options=available_pdfs)
-delete_on_github = st.sidebar.checkbox("Also delete from GitHub", value=False)
+delete_on_github = st.sidebar.checkbox("Also delete from Database", value=False)
 if st.sidebar.button("Delete selected"):
     removed = 0
     for name in files_to_delete:
@@ -265,7 +265,7 @@ if st.sidebar.button("Delete selected"):
             try:
                 gh_delete_file(f"documents/{name}", message_prefix="chore: delete document")
             except Exception as e:
-                st.sidebar.error(f"GitHub delete failed for {name}: {e}")
+                st.sidebar.error(f"Database delete failed for {name}: {e}")
     if removed:
         try:
             build_index()
